@@ -4,6 +4,10 @@
 # intellij config
 .idea/
 
+# ignore video files
+materials/
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

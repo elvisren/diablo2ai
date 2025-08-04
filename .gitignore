@@ -1,3 +1,9 @@
+# mac directory
+.DS_Store
+
+# intellij config
+.idea/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

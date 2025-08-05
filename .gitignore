@@ -7,6 +7,11 @@
 # ignore video files
 materials/
 
+# ignore training files
+cvat/
+code/yolo_training/
+code/yolo11x.pt
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -179,12 +179,16 @@ class ScreenRectifier:
 
         tracked_ok = False
         if self.last_quad is not None and self._prev_gray is not None and self._prev_pts is not None:
-            tracked_ok = self._track(gray)
+            # never let a tracking error bubble up
+            try:
+                tracked_ok = self._track(gray)
+            except Exception:
+                tracked_ok = False
 
         if (self.last_quad is None) or (not tracked_ok) or (self._frame_i % self._force_redetect_every == 0):
             quad = self._detect_monitor(frame)
             if quad is not None:
-                # enforce uniform border (inner by default)
+                # enforce uniform inner border for consistency
                 quad = _snap_to_uniform_border(gray, quad, search_px=60, pick_inner=self._prefer_inner_border)
                 self._set_tracking_seed(gray, quad)
 
@@ -225,25 +229,55 @@ class ScreenRectifier:
         self._H_ema = None
 
     def _track(self, gray: np.ndarray) -> bool:
-        p0 = self._prev_pts
-        p1, st, err = cv2.calcOpticalFlowPyrLK(
-            self._prev_gray, gray, p0, None,
-            winSize=self._lk_win, maxLevel=self._lk_levels,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-        )
-        st = st.reshape(-1); err = err.reshape(-1)
+        # If we don't have a valid seed, ask caller to re-detect
+        if self._prev_gray is None or self._prev_pts is None or self.last_quad is None:
+            return False
+
+        try:
+            p1, st, err = cv2.calcOpticalFlowPyrLK(
+                self._prev_gray, gray, self._prev_pts, None,
+                winSize=self._lk_win, maxLevel=self._lk_levels,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+            )
+        except cv2.error:
+            # optical flow failed — refresh seed on next loop
+            self._prev_gray = gray
+            return False
+
+        # Guard all Nones
+        if p1 is None or st is None or err is None:
+            self._prev_gray = gray
+            return False
+
+        st = st.reshape(-1)
+        err = err.reshape(-1)
         ok = (st == 1) & (err < self._lk_err_thresh)
-        if ok.sum() < 3:
+
+        # Need at least 4 correspondences for a homography
+        if int(ok.sum()) < 4:
+            # Keep last_quad but force a re-detect in caller
+            self._prev_pts = self.last_quad.reshape(4, 1, 2).astype(np.float32)
+            self._prev_gray = gray
             return False
 
-        p0_ok = p0.reshape(-1, 2)[ok]
+        p0_ok = self._prev_pts.reshape(-1, 2)[ok]
         p1_ok = p1.reshape(-1, 2)[ok]
-        H, _ = cv2.findHomography(p0_ok, p1_ok, cv2.RANSAC, 3.0)
-        if H is None:
+
+        try:
+            H, _ = cv2.findHomography(p0_ok, p1_ok, cv2.RANSAC, 3.0)
+        except cv2.error:
+            self._prev_gray = gray
             return False
 
+        if H is None:
+            self._prev_gray = gray
+            return False
+
+        # Update quad via homography
         q_old = self.last_quad.reshape(-1, 1, 2)
         q_new = cv2.perspectiveTransform(q_old, H).reshape(4, 2)
+
+        # Reprojection sanity check
         reproj = float(np.mean(np.linalg.norm(q_new - self.last_quad, axis=1)))
 
         self.last_quad = _order_quad(q_new.astype(np.float32))

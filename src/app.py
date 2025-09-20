@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # qt_app.py
-import sys, time, logging, signal, zoneinfo, datetime
+import sys, time, logging, signal, zoneinfo, datetime, os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 import cv2
 import numpy as np
@@ -15,80 +15,168 @@ logging.basicConfig(level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("qt-app")
 
-# ---------------- Helpers ----------------
+# ---------------- Utils ----------------
 def bgr_to_qimage(frame: np.ndarray) -> QtGui.QImage:
+    """Return a QImage that OWNS its data (avoid dangling NumPy buffer)."""
     h, w = frame.shape[:2]
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
+    img = QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
+    return img.copy()  # ensure independent buffer
 
 def shanghai_timestamp() -> str:
     tz = zoneinfo.ZoneInfo("Asia/Shanghai")
     now = datetime.datetime.now(tz)
     return now.strftime("%Y%m%d_%H%M%S")
 
-# ---------------- Worker thread ----------------
+def fmt_time(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h: return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+# ---------------- Worker ----------------
 class VideoWorker(QtCore.QThread):
+    """
+    Reads frames from 'camera' or 'file', detects/rectifies, and emits:
+      - frame_pair(QImage annotated_left, QImage rectified_right)
+      - rectified_frame_ready(ndarray, float timestamp_seconds)
+      - file_progress(int pct, int idx, int total, float t_cur, float t_total)
+      - file_finished()
+    """
     frame_pair = QtCore.pyqtSignal(QtGui.QImage, QtGui.QImage)
     rectified_frame_ready = QtCore.pyqtSignal(object, float)
+    file_progress = QtCore.pyqtSignal(int, int, int, float, float)
+    file_finished = QtCore.pyqtSignal()
 
-    def __init__(self, device: int, width: int, height: int, fps: int,
-                 target_w: int, target_h: int):
+    def __init__(self,
+                 mode: Literal["camera", "file"],
+                 device: int,
+                 width: int,
+                 height: int,
+                 fps: int,
+                 target_w: int,
+                 target_h: int,
+                 video_path: Optional[Path] = None):
         super().__init__()
-        self.cam = CameraCapture(device, width, height, fps)
+        self.mode = mode
+        self.device = device
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.video_path = str(video_path) if video_path else None
         self.rectifier = ScreenRectifier(target_w, target_h)
         self._running = False
+        self._cap: Optional[cv2.VideoCapture] = None
+
+    def _open_source(self) -> bool:
+        if self.mode == "camera":
+            cam = CameraCapture(self.device, self.width, self.height, self.fps)
+            try:
+                cam.open()
+            except Exception as e:
+                log.error("Camera open failed: %s", e)
+                return False
+            self._cap = cam.cap
+            return True
+        else:
+            if not self.video_path or not os.path.isfile(self.video_path):
+                log.error("Video file not found: %s", self.video_path)
+                return False
+            cap = cv2.VideoCapture(self.video_path)
+            if not cap.isOpened():
+                log.error("Failed to open video file: %s", self.video_path)
+                return False
+            self._cap = cap
+            fps_file = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            log.info("Opened video %s @ %.3f fps, %d frames", self.video_path, fps_file, total)
+            return True
 
     def run(self):
-        try:
-            self.cam.open()
-        except Exception as e:
-            log.error("Camera open failed: %s", e)
+        if not self._open_source():
             return
 
         self._running = True
         last_quad = None
 
+        # Source FPS (fallbacks)
+        src_fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if src_fps <= 0:
+            src_fps = float(self.fps if self.mode == "camera" else 30.0)
+        period = 1.0 / max(1e-6, src_fps)
+
+        total_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) if self.mode == "file" else 0
+        cur_idx = 0
+        t0 = time.perf_counter()
+
         try:
             while self._running:
-                ok, frame = self.cam.read()
+                ok, frame = self._cap.read()
                 if not ok:
+                    if self.mode == "file":
+                        self.file_progress.emit(100, total_frames, total_frames, float(cur_idx/src_fps), float(total_frames/src_fps))
+                        self.file_finished.emit()
+                        break
                     self.msleep(5)
                     continue
 
-                # ---- FIX: no "or" with NumPy arrays; check None explicitly
+                if self.mode == "file":
+                    cur_idx += 1
+
+                # Detect & rectify
                 quad = self.rectifier.detect(frame)
                 if quad is None and last_quad is not None:
                     quad = last_quad
 
                 if quad is not None:
                     last_quad = quad
-                    display_l = self.rectifier.annotate(frame, quad)
+                    left_img = self.rectifier.annotate(frame, quad)
                     rectified = self.rectifier.rectify(frame, quad)
                 else:
-                    display_l = frame
+                    left_img = frame
                     rectified = np.zeros((self.rectifier.target_h, self.rectifier.target_w, 3), np.uint8)
 
-                if not self._running:
-                    break
-                self.frame_pair.emit(bgr_to_qimage(display_l), bgr_to_qimage(rectified))
+                # Emit frames
+                if not self._running: break
+                self.frame_pair.emit(bgr_to_qimage(left_img), bgr_to_qimage(rectified))
 
-                if not self._running:
-                    break
+                if not self._running: break
                 self.rectified_frame_ready.emit(rectified, time.perf_counter())
 
-                self.msleep(1)
+                # Progress + pacing for files
+                if self.mode == "file":
+                    if total_frames > 0:
+                        pct = int(round(100.0 * cur_idx / max(1, total_frames)))
+                        t_cur = float(cur_idx / src_fps)
+                        t_tot = float(total_frames / src_fps)
+                    else:
+                        ratio = float(self._cap.get(cv2.CAP_PROP_POS_AVI_RATIO) or 0.0)
+                        pct = int(round(100.0 * ratio))
+                        t_cur = float(self._cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+                        t_tot = 0.0
+                    self.file_progress.emit(min(100, pct), cur_idx, total_frames, t_cur, t_tot)
+
+                    expected_elapsed = cur_idx * period
+                    now = time.perf_counter() - t0
+                    delay = expected_elapsed - now
+                    if delay > 0:
+                        self.msleep(int(delay * 1000))
+                else:
+                    self.msleep(1)
         finally:
-            self.cam.release()
+            if self._cap is not None:
+                try: self._cap.release()
+                except Exception: pass
+                self._cap = None
 
     def stop(self):
         self._running = False
-        self.wait(1000)  # join up to 1s
+        self.wait(1000)
 
-# ---------------- Recorder (constant-FPS) ----------------
+# ---------------- Recorder ----------------
 class VideoRecorder(QtCore.QObject):
-    """
-    Writes constant-FPS video. If processing lags, duplicates frames so playback stays smooth.
-    """
+    """Constant-FPS writer; duplicates frames to keep timeline if processing lags."""
     def __init__(self, out_dir: Path, fps: int = 30):
         super().__init__()
         self.out_dir = out_dir
@@ -101,21 +189,17 @@ class VideoRecorder(QtCore.QObject):
     def start(self, frame_size: tuple[int, int]) -> Path:
         self.stop()
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        name = f"diablo2_{shanghai_timestamp()}.mp4"
-        path = self.out_dir / name
+        path = self.out_dir / f"diablo2_{shanghai_timestamp()}.mp4"
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         self.writer = cv2.VideoWriter(str(path), fourcc, self.fps, frame_size, True)
         if not self.writer.isOpened():
             raise RuntimeError("Failed to open VideoWriter")
-        self.frame_size = frame_size
-        self.next_t = None
-        self.last_frame = None
+        self.frame_size, self.next_t, self.last_frame = frame_size, None, None
         return path
 
     def stop(self):
         if self.writer is not None:
-            try:
-                self.writer.release()
+            try: self.writer.release()
             finally:
                 self.writer = None
                 self.frame_size = None
@@ -123,83 +207,62 @@ class VideoRecorder(QtCore.QObject):
                 self.last_frame = None
 
     def on_frame(self, frame: np.ndarray, tstamp: float):
-        if self.writer is None:
-            return
+        if self.writer is None: return
         assert self.frame_size is not None
         fh, fw = frame.shape[:2]
         if (fw, fh) != self.frame_size:
             frame = cv2.resize(frame, self.frame_size, interpolation=cv2.INTER_AREA)
 
-        frame_period = 1.0 / self.fps
+        period = 1.0 / self.fps
         if self.next_t is None:
             self.next_t = tstamp
 
         while self.next_t + 1e-6 < tstamp:
             self.writer.write(self.last_frame if self.last_frame is not None else frame)
-            self.next_t += frame_period
+            self.next_t += period
 
         self.writer.write(frame)
         self.last_frame = frame
-        self.next_t += frame_period
+        self.next_t += period
 
-# ---------------- Aspect-locked bottom pair ----------------
-class AspectPair(QtWidgets.QWidget):
-    """
-    Two image panes side-by-side that:
-      - are equal size
-      - fill all available bottom space with no gaps
-      - keep overall aspect = 2 * (pane_aspect)
-    """
-    def __init__(self, pane_aspect: float = 16/9, parent=None):
+# ---------------- Aspect container for fixed preview ratio ----------------
+class AspectContainer(QtWidgets.QWidget):
+    """Keeps its single child (e.g., ImagePane) at a fixed aspect ratio."""
+    def __init__(self, aspect_w: int, aspect_h: int, child: QtWidgets.QWidget, parent=None):
         super().__init__(parent)
-        self.pane_aspect = pane_aspect
-        self.leftPane  = _ImagePane()
-        self.rightPane = _ImagePane()
-        self.setContentsMargins(0, 0, 0, 0)
-        lay = QtWidgets.QGridLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-        lay.addWidget(self.leftPane,  0, 0)
-        lay.addWidget(self.rightPane, 0, 1)
-        lay.setColumnStretch(0, 1)
-        lay.setColumnStretch(1, 1)
+        self._aw, self._ah = aspect_w, aspect_h
+        self._child = child
+        self._child.setParent(self)
+        self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
 
-    def setAspect(self, aspect: float):
-        self.pane_aspect = max(0.1, float(aspect))
-        self.updateGeometry()
-        self.update()
-
-    def sizeHint(self):
-        h = 180
-        w = int(2 * self.pane_aspect * h)
-        return QtCore.QSize(w, h)
-
-    def minimumSizeHint(self):
-        h = 120
-        w = int(2 * self.pane_aspect * h)
-        return QtCore.QSize(w, h)
-
-    def resizeEvent(self, e: QtGui.QResizeEvent):
-        super().resizeEvent(e)
-        W = self.width()
-        H = self.height()
-        desired_h = int(round(W / (2.0 * self.pane_aspect)))
-        if desired_h > H:
-            desired_h = H
-            W_needed = int(round(2.0 * self.pane_aspect * desired_h))
-            left_w  = W_needed // 2
-            right_w = W_needed - left_w
-            x0 = (W - W_needed) // 2
-            self.leftPane.setGeometry(x0, 0, left_w, desired_h)
-            self.rightPane.setGeometry(x0 + left_w, 0, right_w, desired_h)
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        r = self.rect()
+        if self._ah == 0:
+            self._child.setGeometry(r)
+            return
+        target = self._aw / self._ah
+        cur = r.width() / max(1, r.height())
+        if cur > target:
+            # too wide → crop horizontally
+            h = r.height()
+            w = int(round(h * target))
+            x = r.x() + (r.width() - w) // 2
+            y = r.y()
+            self._child.setGeometry(QtCore.QRect(x, y, w, h))
         else:
-            top = (H - desired_h) // 2
-            left_w = W // 2
-            right_w = W - left_w
-            self.leftPane.setGeometry(0, top, left_w, desired_h)
-            self.rightPane.setGeometry(left_w, top, right_w, desired_h)
+            # too tall → crop vertically
+            w = r.width()
+            h = int(round(w / target))
+            x = r.x()
+            y = r.y() + (r.height() - h) // 2
+            self._child.setGeometry(QtCore.QRect(x, y, w, h))
 
-class _ImagePane(QtWidgets.QWidget):
+    def paintEvent(self, e):
+        p = QtGui.QPainter(self)
+        p.fillRect(self.rect(), QtCore.Qt.black)
+
+# ---------------- Image panes ----------------
+class ImagePane(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._image: Optional[QtGui.QImage] = None
@@ -212,129 +275,258 @@ class _ImagePane(QtWidgets.QWidget):
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
-        painter.fillRect(self.rect(), QtCore.Qt.black)
-        if self._image is None:
-            return
-        target = self.rect()
-        img_pm = QtGui.QPixmap.fromImage(self._image)
+        r = self.rect()
+        painter.fillRect(r, QtCore.Qt.black)
+        if self._image is None: return
+        pm = QtGui.QPixmap.fromImage(self._image)
         src_aspect = self._image.width() / max(1, self._image.height())
-        dst_aspect = target.width() / max(1, target.height())
+        dst_aspect = r.width() / max(1, r.height())
 
-        # Fill pane completely (crop if needed), keep aspect
         if abs(src_aspect - dst_aspect) < 1e-3:
-            pm = img_pm.scaled(target.size(), QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
-            painter.drawPixmap(target, pm, pm.rect())
+            scaled = pm.scaled(r.size(), QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
+            painter.drawPixmap(r, scaled, scaled.rect())
         elif src_aspect > dst_aspect:
-            h = target.height()
-            w = int(round(h * src_aspect))
-            pm = img_pm.scaled(w, h, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
-            x = (w - target.width()) // 2
-            painter.drawPixmap(target, pm, QtCore.QRect(x, 0, target.width(), target.height()))
+            h = r.height(); w = int(round(h * src_aspect))
+            scaled = pm.scaled(w, h, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
+            x = (w - r.width()) // 2
+            painter.drawPixmap(r, scaled, QtCore.QRect(x, 0, r.width(), r.height()))
         else:
-            w = target.width()
-            h = int(round(w / src_aspect))
-            pm = img_pm.scaled(w, h, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
-            y = (h - target.height()) // 2
-            painter.drawPixmap(target, pm, QtCore.QRect(0, y, target.width(), target.height()))
+            w = r.width(); h = int(round(w / src_aspect))
+            scaled = pm.scaled(w, h, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
+            y = (h - r.height()) // 2
+            painter.drawPixmap(r, scaled, QtCore.QRect(0, y, r.width(), r.height()))
 
-# ---------------- Main window ----------------
+# ---------------- Main Window ----------------
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Screen Detector (Qt)")
+        self.setWindowTitle("diablo II resurrected AI analyzer")
         self.worker: Optional[VideoWorker] = None
         self.recorder = VideoRecorder(Path("./snapshots"), fps=30)
         self.recording_path: Optional[Path] = None
-        self._resizing = False
 
-        # --- Controls (top) ---
+        # ========== LEFT COLUMN ==========
+        # Camera controls (compact single row)
         self.deviceSpin = QtWidgets.QSpinBox(); self.deviceSpin.setRange(0, 32); self.deviceSpin.setValue(0)
         self.widthSpin  = QtWidgets.QSpinBox(); self.widthSpin.setRange(160, 7680); self.widthSpin.setValue(1920)
         self.heightSpin = QtWidgets.QSpinBox(); self.heightSpin.setRange(120, 4320); self.heightSpin.setValue(1080)
         self.fpsSpin    = QtWidgets.QSpinBox(); self.fpsSpin.setRange(1, 120);      self.fpsSpin.setValue(30)
+        self.camBtn     = QtWidgets.QPushButton("Read from camera")
+
+        camBox = QtWidgets.QGroupBox("Camera")
+        camGrid = QtWidgets.QGridLayout(camBox); camGrid.setContentsMargins(8,8,8,8); camGrid.setHorizontalSpacing(8)
+        row = 0
+        camGrid.addWidget(QtWidgets.QLabel("Device"),  row, 0); camGrid.addWidget(self.deviceSpin,  row, 1)
+        camGrid.addWidget(QtWidgets.QLabel("Width"),   row, 2); camGrid.addWidget(self.widthSpin,   row, 3)
+        camGrid.addWidget(QtWidgets.QLabel("Height"),  row, 4); camGrid.addWidget(self.heightSpin,  row, 5)
+        camGrid.addWidget(QtWidgets.QLabel("FPS"),     row, 6); camGrid.addWidget(self.fpsSpin,     row, 7)
+        camGrid.addWidget(self.camBtn, row+1, 0, 1, 8)
+
+        # File controls
+        self.videoPathEdit = QtWidgets.QLineEdit("")
+        self.browseBtn = QtWidgets.QPushButton("Open file…")
+        self.fileBtn   = QtWidgets.QPushButton("Play from file")
+        self.fileProgress = QtWidgets.QProgressBar(); self.fileProgress.setRange(0, 100); self.fileProgress.setValue(0)
+        self.fileTime = QtWidgets.QLabel("--:-- / --:--")
+
+        fileBox = QtWidgets.QGroupBox("Video file")
+        fileGrid = QtWidgets.QGridLayout(fileBox); fileGrid.setContentsMargins(8,8,8,8); fileGrid.setHorizontalSpacing(8)
+        fileGrid.addWidget(QtWidgets.QLabel("Path"), 0,0)
+        fileGrid.addWidget(self.videoPathEdit, 0,1,1,2)
+        fileGrid.addWidget(self.browseBtn, 0,3)
+        fileGrid.addWidget(self.fileBtn, 1,0)
+        fileGrid.addWidget(self.fileProgress, 1,1,1,2)
+        fileGrid.addWidget(self.fileTime, 1,3)
+
+        leftTop = QtWidgets.QVBoxLayout()
+        leftTop.setContentsMargins(8,8,8,4); leftTop.setSpacing(8)
+        leftTop.addWidget(camBox)
+        leftTop.addWidget(fileBox)
+        leftTopW = QtWidgets.QWidget(); leftTopW.setLayout(leftTop)
+
+        self.leftPane = ImagePane()
+
+        # ========== RIGHT COLUMN ==========
         self.targetWSpin= QtWidgets.QSpinBox(); self.targetWSpin.setRange(320, 7680); self.targetWSpin.setValue(3840)
         self.targetHSpin= QtWidgets.QSpinBox(); self.targetHSpin.setRange(180, 4320); self.targetHSpin.setValue(2160)
-
-        self.runBtn = QtWidgets.QPushButton("Run")
         self.savePathEdit = QtWidgets.QLineEdit("./snapshots/")
-        self.saveBtn = QtWidgets.QPushButton("Save to file")
+        self.saveBtn = QtWidgets.QPushButton("Start recording")
 
-        self.topBox = QtWidgets.QWidget()
-        top = QtWidgets.QGridLayout(self.topBox)
-        top.setContentsMargins(8, 8, 8, 4)
-        top.setHorizontalSpacing(8)
-        r = 0
-        top.addWidget(QtWidgets.QLabel("Device"), r, 0); top.addWidget(self.deviceSpin, r, 1)
-        top.addWidget(QtWidgets.QLabel("Width"),  r, 2); top.addWidget(self.widthSpin,  r, 3)
-        top.addWidget(QtWidgets.QLabel("Height"), r, 4); top.addWidget(self.heightSpin, r, 5)
-        top.addWidget(QtWidgets.QLabel("FPS"),    r, 6); top.addWidget(self.fpsSpin,    r, 7)
-        r += 1
-        top.addWidget(QtWidgets.QLabel("Target W"), r, 0); top.addWidget(self.targetWSpin, r, 1)
-        top.addWidget(QtWidgets.QLabel("Target H"), r, 2); top.addWidget(self.targetHSpin, r, 3)
-        top.addWidget(self.runBtn, r, 6)
-        r += 1
-        top.addWidget(QtWidgets.QLabel("Save dir"), r, 0); top.addWidget(self.savePathEdit, r, 1, 1, 5)
-        top.addWidget(self.saveBtn, r, 6)
+        # 1) Display and Record
+        grp_display = QtWidgets.QGroupBox("Display and Record")
+        g1 = QtWidgets.QGridLayout(grp_display); g1.setContentsMargins(8,8,8,8); g1.setHorizontalSpacing(8); g1.setVerticalSpacing(6)
+        g1.addWidget(QtWidgets.QLabel("Target Width"),  0, 0); g1.addWidget(self.targetWSpin, 0, 1)
+        g1.addWidget(QtWidgets.QLabel("Target Height"), 0, 2); g1.addWidget(self.targetHSpin, 0, 3)
 
-        # --- Bottom aspect-locked pair ---
-        pane_aspect = self.targetWSpin.value() / self.targetHSpin.value()
-        self.pair = AspectPair(pane_aspect)
-        self.pair.setContentsMargins(0, 0, 0, 0)
+        # 2) Save processed result
+        grp_save = QtWidgets.QGroupBox("Save processed result")
+        g2 = QtWidgets.QGridLayout(grp_save); g2.setContentsMargins(8,8,8,8); g2.setHorizontalSpacing(8); g2.setVerticalSpacing(6)
+        g2.addWidget(QtWidgets.QLabel("Save dir"), 0, 0); g2.addWidget(self.savePathEdit, 0, 1, 1, 2); g2.addWidget(self.saveBtn, 0, 3)
 
-        self.layout = QtWidgets.QVBoxLayout(self)
-        self.layout.setContentsMargins(8, 8, 8, 8)
-        self.layout.setSpacing(0)
-        self.layout.addWidget(self.topBox, 0)
-        self.layout.addWidget(self.pair, 1)
+        rightTop = QtWidgets.QVBoxLayout()
+        rightTop.setContentsMargins(8,8,8,4); rightTop.setSpacing(8)
+        rightTop.addWidget(grp_display)
+        rightTop.addWidget(grp_save)
+        rightTopW = QtWidgets.QWidget(); rightTopW.setLayout(rightTop)
 
-        self.runBtn.clicked.connect(self.toggle_run)
+        self.rightPane = ImagePane()
+
+        # Wrap panes in fixed-aspect containers (display content 3840x2160)
+        self.leftAspect  = AspectContainer(3840, 2160, self.leftPane)
+        self.rightAspect = AspectContainer(3840, 2160, self.rightPane)
+
+        # ========== GRID: no gaps around preview row ==========
+        grid = QtWidgets.QGridLayout(self)
+        grid.setContentsMargins(0,0,0,0)
+        grid.setHorizontalSpacing(0)
+        grid.setVerticalSpacing(0)
+
+        grid.addWidget(leftTopW,          0, 0)
+        grid.addWidget(rightTopW,         0, 1)
+        grid.addWidget(self.leftAspect,   1, 0)
+        grid.addWidget(self.rightAspect,  1, 1)
+
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(0, 0)   # controls
+        grid.setRowStretch(1, 1)   # previews fill remaining space
+
+        # ---- Keep references & dynamic (but safe) controls height
+        self.leftTopW = leftTopW
+        self.rightTopW = rightTopW
+
+        self._base_controls_h = max(self.leftTopW.sizeHint().height(),
+                                    self.rightTopW.sizeHint().height())
+        pad = 12  # extra breathing room for fonts/OS
+        self._controls_h_min = self._base_controls_h + pad
+
+        for w in (self.leftTopW, self.rightTopW):
+            w.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Minimum)
+            w.setMinimumHeight(self._controls_h_min)
+
+        # Preview band aspect (two 16:9 panes side-by-side)
+        self._preview_aspect = 32.0 / 9.0
+        self._resizing_guard = False
+
+        # Reasonable minimum window size
+        min_w = 1200
+        min_h = self._controls_h_min + int(round(min_w / self._preview_aspect))
+        self.setMinimumSize(min_w, min_h)
+
+        # ---- Signals
+        self.camBtn.clicked.connect(self.toggle_camera)
+        self.fileBtn.clicked.connect(self.toggle_file)
+        self.browseBtn.clicked.connect(self.choose_video)
         self.saveBtn.clicked.connect(self.toggle_recording)
-        self.targetWSpin.valueChanged.connect(self._on_target_aspect_changed)
-        self.targetHSpin.valueChanged.connect(self._on_target_aspect_changed)
+        self.targetWSpin.valueChanged.connect(self._on_target_changed)
+        self.targetHSpin.valueChanged.connect(self._on_target_changed)
 
+        # Graceful quit
         app = QtWidgets.QApplication.instance()
         if app:
             app.aboutToQuit.connect(self.cleanup)
 
-        self.resize(1200, 720)
-        QtCore.QTimer.singleShot(0, self._snap_window_to_aspect)
+        # Initial state
+        self._set_camera_controls_enabled(True)
+        self._set_file_controls_enabled(True)
 
-    # Keep window height matched to aspect so no outer gaps appear
+        # Dark sci-fi theme
+        self._apply_dark_theme()
+
+        # Initial size
+        self.resize(2000, self._controls_h_min + int(round(2000 / self._preview_aspect)))
+
+    # ---------- Theme ----------
+    def _apply_dark_theme(self):
+        palette = QtGui.QPalette()
+        bg = QtGui.QColor(18, 18, 22)
+        panel = QtGui.QColor(28, 28, 35)
+        text = QtGui.QColor(230, 230, 235)
+        acc = QtGui.QColor(120, 170, 255)
+
+        palette.setColor(QtGui.QPalette.Window, bg)
+        palette.setColor(QtGui.QPalette.Base, panel)
+        palette.setColor(QtGui.QPalette.AlternateBase, bg)
+        palette.setColor(QtGui.QPalette.WindowText, text)
+        palette.setColor(QtGui.QPalette.Text, text)
+        palette.setColor(QtGui.QPalette.Button, panel)
+        palette.setColor(QtGui.QPalette.ButtonText, text)
+        palette.setColor(QtGui.QPalette.Highlight, acc)
+        palette.setColor(QtGui.QPalette.BrightText, QtCore.Qt.white)
+        self.setPalette(palette)
+
+        self.setStyleSheet("""
+        QWidget { color: #E6E6EB; }
+        QGroupBox {
+            border: 1px solid #3a3f4b; border-radius: 10px; margin-top: 12px;
+            background: #1c1c23; padding: 8px 10px 10px 10px;
+        }
+        QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; color: #9fb0ff; }
+        QPushButton {
+            background: #2a2f3b; border: 1px solid #3f4656; border-radius: 8px; padding: 8px 12px;
+        }
+        QPushButton:hover { border-color: #7aa2ff; background: #2f3544; }
+        QPushButton:pressed { background: #242a36; }
+        QLineEdit, QSpinBox {
+            background: #20232c; border: 1px solid #3a3f4b; border-radius: 6px; padding: 4px 6px;
+        }
+        QLineEdit:hover, QSpinBox:hover { border-color: #7aa2ff; }
+        QProgressBar {
+            background: #20232c; border: 1px solid #3a3f4b; border-radius: 6px; text-align: center;
+        }
+        QProgressBar::chunk { background-color: #7aa2ff; }
+        """)
+
+    # ---------- New resize logic: preview band exact 32:9, controls height dynamic ----------
     def resizeEvent(self, e: QtGui.QResizeEvent):
-        super().resizeEvent(e)
-        if self._resizing:
-            return
-        self._snap_window_to_aspect()
+        """
+        Keep the preview row exact 32:9 with zero gaps.
+        total_height = controls_h(dynamic) + width / (32/9)
+        """
+        if self._resizing_guard:
+            return super().resizeEvent(e)
 
-    def closeEvent(self, event: QtGui.QCloseEvent):
-        self.cleanup()
-        super().closeEvent(event)
-
-    def _snap_window_to_aspect(self):
-        self._resizing = True
+        self._resizing_guard = True
         try:
-            aspect = self.targetWSpin.value() / max(1, self.targetHSpin.value())
-            top_h = self.topBox.sizeHint().height()
-            total_w = self.width() - (self.layout.contentsMargins().left() + self.layout.contentsMargins().right())
-            pair_h = int(round(total_w / (2.0 * aspect)))
-            wanted = (self.layout.contentsMargins().top() + top_h + pair_h +
-                      self.layout.contentsMargins().bottom())
-            if abs(self.height() - wanted) > 1:
-                self.resize(self.width(), wanted)
+            new_w, new_h = e.size().width(), e.size().height()
+            old_w, old_h = e.oldSize().width(), e.oldSize().height()
+
+            # Real-time controls row height (protect with a minimum)
+            controls_h = max(self.leftTopW.height(), self.rightTopW.height(), self._controls_h_min)
+
+            dw = abs(new_w - (old_w if old_w > 0 else new_w))
+            dh = abs(new_h - (old_h if old_h > 0 else new_h))
+
+            if dw >= dh:
+                # Drive height from width
+                target_h = controls_h + int(round(new_w / self._preview_aspect))
+                if target_h != new_h:
+                    self.resize(new_w, max(target_h, self.minimumHeight()))
+            else:
+                # Drive width from height
+                preview_h = max(1, new_h - controls_h)
+                target_w = int(round(preview_h * self._preview_aspect))
+                if target_w != new_w:
+                    self.resize(max(target_w, self.minimumWidth()), new_h)
         finally:
-            self._resizing = False
+            self._resizing_guard = False
 
-    def _on_target_aspect_changed(self):
-        a = self.targetWSpin.value() / max(1, self.targetHSpin.value())
-        self.pair.setAspect(a)
-        self._snap_window_to_aspect()
+        super().resizeEvent(e)
 
-    # ---- Runtime control
-    def toggle_run(self):
-        if self.worker and self.worker.isRunning():
-            self.stop_worker()
-            self.runBtn.setText("Run")
+    # ---------- Source toggles ----------
+    def toggle_camera(self):
+        if self.worker and self.worker.isRunning() and getattr(self.worker, "mode", None) == "camera":
+            self._stop_worker()
+            self.camBtn.setText("Read from camera")
+            self._set_file_controls_enabled(True)
+            self._set_camera_controls_enabled(True)
             return
+
+        if self.worker and getattr(self.worker, "mode", None) == "file":
+            self._stop_worker()
+            self.fileBtn.setText("Play from file")
+            self.fileProgress.setValue(0)
+            self.fileTime.setText("--:-- / --:--")
 
         dev = self.deviceSpin.value()
         w   = self.widthSpin.value()
@@ -343,36 +535,101 @@ class MainWindow(QtWidgets.QWidget):
         tw  = self.targetWSpin.value()
         th  = self.targetHSpin.value()
 
-        self.worker = VideoWorker(dev, w, h, fps, tw, th)
+        self.worker = VideoWorker("camera", dev, w, h, fps, tw, th)
+        self._connect_worker_common()
+        self.worker.start()
+
+        self.camBtn.setText("Stop camera")
+        self._set_file_controls_enabled(False)
+        self._set_camera_controls_enabled(True)
+
+    def toggle_file(self):
+        if self.worker and self.worker.isRunning() and getattr(self.worker, "mode", None) == "file":
+            self._stop_worker()
+            self.fileBtn.setText("Play from file")
+            self._set_camera_controls_enabled(True)
+            self._set_file_controls_enabled(True)
+            return
+
+        if self.worker and getattr(self.worker, "mode", None) == "camera":
+            self._stop_worker()
+            self.camBtn.setText("Read from camera")
+
+        vpath = self.videoPathEdit.text().strip()
+        if not vpath:
+            self.choose_video()
+            vpath = self.videoPathEdit.text().strip()
+            if not vpath:
+                return
+
+        tw  = self.targetWSpin.value()
+        th  = self.targetHSpin.value()
+
+        self.worker = VideoWorker("file", 0, 0, 0, 0, tw, th, Path(vpath))
+        self._connect_worker_common()
+        self.worker.file_progress.connect(self.on_file_progress)
+        self.worker.file_finished.connect(self.on_file_finished)
+        self.worker.start()
+
+        self.fileBtn.setText("Stop from file")
+        self._set_camera_controls_enabled(False)
+        self._set_file_controls_enabled(True)
+        self.fileProgress.setValue(0)
+        self.fileTime.setText("00:00 / " + self._read_total_time(vpath))
+
+    def choose_video(self):
+        start_dir = Path(self.savePathEdit.text()).expanduser().resolve()
+        if not start_dir.exists():
+            start_dir = Path("./snapshots").resolve()
+        fname, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select video", str(start_dir),
+            "Video Files (*.mp4 *.mov *.avi *.mkv);;All Files (*)"
+        )
+        if fname:
+            self.videoPathEdit.setText(fname)
+
+    def _connect_worker_common(self):
         self.worker.frame_pair.connect(self.on_frame_pair)
         self.worker.rectified_frame_ready.connect(self.on_rectified_frame)
         self.worker.finished.connect(lambda: log.info("Worker finished"))
-        self.worker.start()
-        self.runBtn.setText("Stop")
 
-    def stop_worker(self):
+    def _stop_worker(self):
         if self.worker:
             try:
-                # disconnect first to avoid late emits into deleted widgets
                 try: self.worker.frame_pair.disconnect(self.on_frame_pair)
                 except TypeError: pass
                 try: self.worker.rectified_frame_ready.disconnect(self.on_rectified_frame)
                 except TypeError: pass
+                try: self.worker.file_progress.disconnect(self.on_file_progress)
+                except Exception: pass
+                try: self.worker.file_finished.disconnect(self.on_file_finished)
+                except Exception: pass
                 self.worker.stop()
             finally:
                 self.worker = None
         if self.recording_path is not None:
             self.stop_recording()
 
-    def cleanup(self):
-        self.stop_worker()
+    def _set_file_controls_enabled(self, enabled: bool):
+        self.videoPathEdit.setEnabled(enabled)
+        self.browseBtn.setEnabled(enabled)
+        self.fileBtn.setEnabled(enabled)
 
-    # ---- Display
+    def _set_camera_controls_enabled(self, enabled: bool):
+        self.deviceSpin.setEnabled(enabled)
+        self.widthSpin.setEnabled(enabled)
+        self.heightSpin.setEnabled(enabled)
+        self.fpsSpin.setEnabled(enabled)
+        self.camBtn.setEnabled(enabled)
+
+    # ---------- Display / record ----------
     def on_frame_pair(self, left: QtGui.QImage, right: QtGui.QImage):
-        self.pair.leftPane.setImage(left)
-        self.pair.rightPane.setImage(right)
+        self.leftPane.setImage(left)
+        self.rightPane.setImage(right)
 
-    # ---- Recording
+    def _on_target_changed(self):
+        pass
+
     def toggle_recording(self):
         if self.recording_path is None:
             out_dir = Path(self.savePathEdit.text()).expanduser().resolve()
@@ -381,7 +638,7 @@ class MainWindow(QtWidgets.QWidget):
             th = self.targetHSpin.value()
             try:
                 self.recording_path = self.recorder.start((tw, th))
-                self.saveBtn.setText("Stop saving")
+                self.saveBtn.setText("Stop recording")
                 self.savePathEdit.setText(str(out_dir))
                 log.info("Recording to %s", self.recording_path)
             except Exception as e:
@@ -396,18 +653,52 @@ class MainWindow(QtWidgets.QWidget):
             log.info("Saved video: %s", self.recording_path)
         finally:
             self.recording_path = None
-            self.saveBtn.setText("Save to file")
+            self.saveBtn.setText("Start recording")
 
     def on_rectified_frame(self, frame, tstamp: float):
-        if self.recording_path is None:
-            return
+        if self.recording_path is None: return
         self.recorder.on_frame(frame, tstamp)
+
+    # ---------- File progress ----------
+    def on_file_progress(self, pct: int, idx: int, total: int, t_cur: float, t_tot: float):
+        if total > 0:
+            self.fileProgress.setRange(0, 100)
+            self.fileProgress.setValue(max(0, min(100, pct)))
+            self.fileTime.setText(f"{fmt_time(t_cur)} / {fmt_time(t_tot)}")
+        else:
+            self.fileProgress.setRange(0, 0)
+            self.fileTime.setText(f"{fmt_time(t_cur)} / --:--")
+
+    def on_file_finished(self):
+        self.fileProgress.setRange(0, 100)
+        self.fileProgress.setValue(100)
+        self.fileBtn.setText("Play from file")
+        self._set_camera_controls_enabled(True)
+
+    def _read_total_time(self, vpath: str) -> str:
+        try:
+            cap = cv2.VideoCapture(vpath)
+            if not cap.isOpened(): return "--:--"
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            n   = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+            cap.release()
+            if fps > 0 and n > 0:
+                return fmt_time(n / fps)
+        except Exception:
+            pass
+        return "--:--"
+
+    # ---------- Cleanup ----------
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        self.cleanup()
+        super().closeEvent(event)
+
+    def cleanup(self):
+        self._stop_worker()
 
 # ---------------- main ----------------
 def main():
     app = QtWidgets.QApplication(sys.argv)
-
-    # Graceful Ctrl-C: quit event loop instead of raising KeyboardInterrupt
     signal.signal(signal.SIGINT, lambda *_: app.quit())
     ping = QtCore.QTimer(); ping.start(100); ping.timeout.connect(lambda: None)
 

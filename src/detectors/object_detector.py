@@ -54,9 +54,9 @@ class ObjectDetector:
         here = Path(__file__).resolve()                 # .../src/detectors/object_detector.py
         src_root = here.parent.parent                   # .../src
         candidates = [
-            src_root / "models" / "yolo11m.pt",         # …/src/models/yolo11m.pt   (your layout)
-            Path.cwd() / "models" / "yolo11m.pt",       # …/<cwd>/models/yolo11m.pt (fallback)
-            here.parent / "yolo11m.pt",                 # …/src/detectors/yolo11m.pt (last resort)
+            src_root / "models" / "yolo11x.pt",         # …/src/models/yolo11m.pt   (your layout)
+            Path.cwd() / "models" / "yolo11x.pt",       # …/<cwd>/models/yolo11m.pt (fallback)
+            here.parent / "yolo11x.pt",                 # …/src/detectors/yolo11m.pt (last resort)
         ]
         for p in candidates:
             if p.exists():

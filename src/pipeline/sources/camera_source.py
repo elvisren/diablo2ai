@@ -1,11 +1,10 @@
 from __future__ import annotations
-from typing import Optional
 import logging, cv2
 from ..interfaces import VideoSource
 log = logging.getLogger("pipeline.sources.camera")
 
 try:
-    from ...camera_capture import CameraCapture as _UserCamera
+    from src.pipeline.sources.camera_capture import CameraCapture as _UserCamera
 except Exception as _e:
     _UserCamera = None
     log.debug("User CameraCapture not available: %s", _e)

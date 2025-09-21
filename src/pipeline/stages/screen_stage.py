@@ -1,7 +1,7 @@
 from __future__ import annotations
-import logging, cv2, numpy as np
+import logging, numpy as np
 from ..interfaces import FrameBundle, PipelineStage
-from ...screen_detector import ScreenRectifier
+from src.pipeline.stages.screen_detector import ScreenRectifier
 
 log = logging.getLogger("pipeline.stages.screen")
 

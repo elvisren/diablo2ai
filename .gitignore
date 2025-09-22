@@ -7,6 +7,11 @@ snapshots/
 
 # yolo model file
 models/
+src/script/cache/
+src/script/monstor_image
+src/script/other_image/
+src/script/out/
+src/script/runs/
 
 # mac file
 .DS_Store

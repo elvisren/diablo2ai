@@ -30,15 +30,17 @@ class ObjectDetector:
     def __init__(
         self,
         model_path: Optional[str] = None,
-        conf: float = 0.25,
+        conf: float = 0.05,
         iou: float = 0.45,
-        max_det: int = 100,
+        max_det: int = 300,
+        imgsz: int = 1280,
         device: Optional[str] = None,
     ):
         self.conf = conf
         self.iou = iou
         self.max_det = max_det
         self.device = device
+        self.imgsz = imgsz
 
         # --- NEW: Resolve default model candidates if model_path not given ---
         self.model_path = self._resolve_model_path(model_path)
@@ -54,9 +56,9 @@ class ObjectDetector:
         here = Path(__file__).resolve()                 # .../src/detectors/object_detector.py
         src_root = here.parent.parent                   # .../src
         candidates = [
-            src_root / "models" / "yolo11x.pt",         # …/src/models/yolo11m.pt   (your layout)
-            Path.cwd() / "models" / "yolo11x.pt",       # …/<cwd>/models/yolo11m.pt (fallback)
-            here.parent / "yolo11x.pt",                 # …/src/detectors/yolo11m.pt (last resort)
+            src_root / "models" / "best.pt",         # …/src/models/yolo11m.pt   (your layout)
+            Path.cwd() / "models" / "best.pt",       # …/<cwd>/models/yolo11m.pt (fallback)
+            here.parent / "best.pt",                 # …/src/detectors/yolo11m.pt (last resort)
         ]
         for p in candidates:
             if p.exists():
@@ -111,7 +113,8 @@ class ObjectDetector:
             conf=self.conf,
             iou=self.iou,
             max_det=self.max_det,
-            verbose=False,
+            imgsz=self.imgsz,
+            verbose=True,
             device=self.device if self.device else None,
         )
 

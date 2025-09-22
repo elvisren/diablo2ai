@@ -2,7 +2,7 @@ from __future__ import annotations
 import logging, cv2
 from typing import Optional
 from ..interfaces import FrameBundle, PipelineStage
-from ...detectors.object_detector import ObjectDetector, DetectionResult
+from src.pipeline.stages.object_detector import ObjectDetector, DetectionResult
 
 log = logging.getLogger("pipeline.stages.object")
 

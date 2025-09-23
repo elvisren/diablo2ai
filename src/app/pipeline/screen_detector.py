@@ -2,11 +2,14 @@
 # screen_detector.py
 from __future__ import annotations
 
+import argparse
+import os
+import time
 import cv2
 import numpy as np
 from typing import Optional, Tuple, List
 
-# ----------------- helpers (same names where used before) -----------------
+# ----------------- helpers (kept names) -----------------
 
 def _order_quad(pts4: np.ndarray) -> np.ndarray:
     pts = np.array(pts4, dtype=np.float32)
@@ -38,40 +41,6 @@ def _poly_orthogonality_score(pts: np.ndarray) -> float:
         diffs.append(abs(ang - 90.0))
     return float(np.mean(diffs))
 
-def _mean_inside_outside(gray: np.ndarray, quad: np.ndarray, inward_px=8, outward_px=8) -> float:
-    q = _order_quad(quad).astype(np.float32)
-    h, w = gray.shape[:2]
-
-    def collect(p1, p2, nvec, di, do):
-        N = max(12, int(np.linalg.norm(p2 - p1) / 12))
-        ts = np.linspace(0, 1, N)
-        edge = (p1[None, :] + ts[:, None] * (p2 - p1)[None, :])
-        a = np.clip((edge + nvec * di).round().astype(int), [0, 0], [w - 1, h - 1])
-        b = np.clip((edge - nvec * do).round().astype(int), [0, 0], [w - 1, h - 1])
-        return gray[a[:, 1], a[:, 0]], gray[b[:, 1], b[:, 0]]
-
-    inside_vals, outside_vals = [], []
-    for i in range(4):
-        p1, p2 = q[i], q[(i + 1) % 4]
-        v = p2 - p1
-        L = max(1e-6, np.linalg.norm(v))
-        n = np.array([-(v[1] / L), (v[0] / L)], dtype=np.float32)
-        a, b = collect(p1, p2, n, inward_px, outward_px)
-        a2, b2 = collect(p1, p2, -n, inward_px, outward_px)
-        if np.var(a) > np.var(a2):
-            inside_vals.append(a); outside_vals.append(b)
-        else:
-            inside_vals.append(a2); outside_vals.append(b2)
-    return float(np.mean(np.concatenate(inside_vals)) - np.mean(np.concatenate(outside_vals)))
-
-def _make_lsd():
-    try:
-        if hasattr(cv2, "LSD_REFINE_STD"):
-            return cv2.createLineSegmentDetector(refine=cv2.LSD_REFINE_STD)
-        return cv2.createLineSegmentDetector()
-    except Exception:
-        return None
-
 def _line_from_segment(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
     x1, y1, x2, y2 = map(float, [p1[0], p1[1], p2[0], p2[1]])
     a = y1 - y2; b = x2 - x1; c = x1 * y2 - x2 * y1
@@ -89,115 +58,178 @@ def _intersect_lines(L1: np.ndarray, L2: np.ndarray) -> Optional[np.ndarray]:
     y = (c1 * a2 - c2 * a1) / det
     return np.array([x, y], dtype=np.float32)
 
-# ---------- snap all sides to a uniform border (inner by default) ----------
+def _quad_center(quad: np.ndarray) -> Tuple[float, float]:
+    q = _order_quad(quad)
+    return float(q[:, 0].mean()), float(q[:, 1].mean())
 
-def _snap_to_uniform_border(gray: np.ndarray, quad: np.ndarray, search_px: int = 60, pick_inner: bool = True) -> np.ndarray:
+def _point_in_quad(pt: np.ndarray, quad: np.ndarray) -> bool:
+    return cv2.pointPolygonTest(quad.reshape(-1,1,2), (float(pt[0]), float(pt[1])), False) >= 0
+
+# ----------------- robust inward refinement (NEW) -----------------
+
+def _consistent_inward_normals(quad: np.ndarray) -> List[np.ndarray]:
+    """Normals that all point toward the quad centroid."""
     q = _order_quad(quad.astype(np.float32))
-    h, w = gray.shape[:2]
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-
-    shifted = []
+    cx, cy = q[:,0].mean(), q[:,1].mean()
+    normals = []
     for i in range(4):
-        p1, p2 = q[i], q[(i + 1) % 4]
+        p1, p2 = q[i], q[(i+1)%4]
         v = p2 - p1
         L = max(1e-6, np.linalg.norm(v))
         t = v / L
-        n = np.array([-t[1], t[0]], dtype=np.float32)
+        n = np.array([-t[1], t[0]], dtype=np.float32)  # one normal
+        mid = 0.5*(p1+p2)
+        # choose direction that points toward centroid
+        if np.dot(np.array([cx,cy],dtype=np.float32) - mid, n) < 0:
+            n = -n
+        normals.append(n)
+    return normals
 
-        # choose inside direction by variance
-        N = max(16, int(L // 18))
-        ts = np.linspace(0, 1, N)
-        edge = (p1[None, :] + ts[:, None] * v[None, :]).astype(np.float32)
-        probe = 6
-        a = np.clip((edge + n[None, :] * probe).round().astype(int), [0,0], [w-1,h-1])
-        b = np.clip((edge - n[None, :] * probe).round().astype(int), [0,0], [w-1,h-1])
-        inside_dir = n if np.var(gray[a[:,1], a[:,0]]) > np.var(gray[b[:,1], b[:,0]]) else -n
+def _score_along_normal(gray: np.ndarray, gx: np.ndarray, gy: np.ndarray,
+                        edge_pts: np.ndarray, nvec: np.ndarray,
+                        s: int, delta: int, strip: int) -> float:
+    """
+    Evaluate boundary-likeness at offset s:
+      α*|∇| + β*(inside_edge - outside_edge) + γ*(outside_mean - inside_mean)
+    where inside is at s+delta, outside at s-delta.
+    """
+    h, w = gray.shape[:2]
+    # central line (at s), plus two strips (inside/outside)
+    def sample(off):
+        samp = edge_pts + nvec[None,:]*off
+        xs = np.clip(samp[:,0].astype(int), 0, w-1)
+        ys = np.clip(samp[:,1].astype(int), 0, h-1)
+        return xs, ys
 
-        direction = inside_dir if pick_inner else -inside_dir
+    xs_c, ys_c = sample(s)
+    xs_i, ys_i = sample(s + delta)
+    xs_o, ys_o = sample(max(0, s - delta))
 
-        # 1-D gradient ridge search
-        best_s, best_mag = 0, -1.0
-        for s in range(0, search_px + 1):
-            samp = edge + direction[None, :] * s
-            xs = np.clip(samp[:, 0].astype(int), 0, w - 1)
-            ys = np.clip(samp[:, 1].astype(int), 0, h - 1)
-            mag = float(np.mean(np.hypot(gx[ys, xs], gy[ys, xs])))
-            if mag > best_mag:
-                best_mag, best_s = mag, s
+    # widen to strip by averaging a few sub-offsets along normal
+    def strip_mean(xs, ys, base_off, sign):
+        acc_g, acc_i = 0.0, 0.0
+        steps = max(1, strip)
+        for k in range(steps):
+            o = base_off + sign*k
+            xs_k, ys_k = sample(o)
+            acc_g += float(np.mean(np.hypot(gx[ys_k, xs_k], gy[ys_k, xs_k])))
+            acc_i += float(np.mean(gray[ys_k, xs_k]))
+        return acc_g/steps, acc_i/steps
 
-        p1s, p2s = p1 + direction * best_s, p2 + direction * best_s
-        shifted.append(_line_from_segment(p1s, p2s))
+    g_c = float(np.mean(np.hypot(gx[ys_c, xs_c], gy[ys_c, xs_c])))
+    g_i, m_i = strip_mean(xs_i, ys_i, s + delta, +1)
+    g_o, m_o = strip_mean(xs_o, ys_o, max(0, s - delta), -1)
 
+    # weights (tuned conservatively; raise β if bezel reflectance is tricky)
+    alpha, beta, gamma = 1.0, 1.8, 0.7
+    return alpha*g_c + beta*(g_i - g_o) + gamma*(m_o - m_i)
+
+def _refine_to_inner(gray: np.ndarray, outer_quad: np.ndarray,
+                     search_in_px: int = 140,
+                     bezel_min_px: int = 4,
+                     bezel_max_px: int = 100,
+                     delta: int = 6,
+                     strip: int = 3) -> np.ndarray:
+    """
+    Refine each side of 'outer_quad' strictly INWARD to the inner panel edge
+    using a robust objective. Normals are globally consistent (centroid-based).
+    """
+    q = _order_quad(outer_quad.astype(np.float32))
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    normals = _consistent_inward_normals(q)
+
+    inner_lines = []
+    for i in range(4):
+        p1, p2 = q[i], q[(i+1)%4]
+        v = p2 - p1
+        L = max(1e-6, np.linalg.norm(v))
+        n = normals[i]
+        # edge samples along the side
+        N = max(24, int(L // 14))
+        ts = np.linspace(0, 1, N).astype(np.float32)
+        edge_pts = (p1[None,:] + ts[:,None]*(p2 - p1)[None,:]).astype(np.float32)
+
+        # scan inward offsets
+        s_min = max(0, bezel_min_px)
+        s_max = max(s_min + 1, min(search_in_px, bezel_max_px + 40))
+        best_s, best_val = s_min, -1e9
+        for s in range(s_min, s_max+1):
+            val = _score_along_normal(gray, gx, gy, edge_pts, n, s, delta, strip)
+            if val > best_val:
+                best_val, best_s = val, s
+
+        # build line at best_s
+        p1s, p2s = p1 + n*best_s, p2 + n*best_s
+        inner_lines.append(_line_from_segment(p1s, p2s))
+
+    # intersect to form inner quad
     P = [
-        _intersect_lines(shifted[3], shifted[0]),
-        _intersect_lines(shifted[0], shifted[1]),
-        _intersect_lines(shifted[1], shifted[2]),
-        _intersect_lines(shifted[2], shifted[3]),
+        _intersect_lines(inner_lines[3], inner_lines[0]),
+        _intersect_lines(inner_lines[0], inner_lines[1]),
+        _intersect_lines(inner_lines[1], inner_lines[2]),
+        _intersect_lines(inner_lines[2], inner_lines[3]),
     ]
     if any(p is None for p in P):
-        return q
-    return _order_quad(np.stack(P, axis=0))
+        return q  # fallback
+    q_in = _order_quad(np.stack(P, axis=0))
+
+    # keep inner strictly inside outer; if not, nudge inward uniformly
+    if not all(_point_in_quad(q_in[k], q) for k in range(4)):
+        # move a little further inward along each side's normal
+        bump = 6.0
+        q_fix = q_in.copy()
+        for i in range(4):
+            p = q_in[i]
+            q_fix[i] = p + normals[i]*bump
+        q_in = _order_quad(q_fix.astype(np.float32))
+
+    return q_in
 
 # ----------------- main detector (PUBLIC API KEPT) -----------------
 
 class ScreenRectifier:
     """
     Public API (unchanged):
-      - detect(frame) -> Optional[np.ndarray]
+      - detect(frame) -> Optional[np.ndarray]          # returns INNER quad
       - rectify(frame, quad) -> np.ndarray
       - annotate(frame, quad) -> np.ndarray
       - warp_to_size(frame, quad) -> np.ndarray
     """
 
-    def __init__(self, target_w: int = 3840, target_h: int = 2160, trim_bezel: bool = True, max_trim_px: int = 40):
+    def __init__(
+        self,
+        target_w: int = 3840,
+        target_h: int = 2160,
+        # backward-compat args
+        trim_bezel: bool = True,
+        max_trim_px: int = 60,
+        # hierarchy thresholds
+        min_pair_area_ratio: float = 0.80,
+        max_pair_area_ratio: float = 0.995,
+        max_center_delta_frac: float = 0.03,
+        # inward refinement
+        search_in_px: int = 140,
+        bezel_min_px: int = 4,
+        bezel_max_px: int = 100,
+        **kwargs,
+    ):
         self.target_w = target_w
         self.target_h = target_h
-        self.trim_bezel = trim_bezel
-        self.max_trim_px = max_trim_px
-
-        # internal state
-        self.last_quad: Optional[np.ndarray] = None
-        self._H_ema: Optional[np.ndarray] = None
-        self._prev_gray: Optional[np.ndarray] = None
-        self._prev_pts: Optional[np.ndarray] = None
-        self._frame_i: int = 0
-
-        # tuning
-        self._prefer_inner_border = True
-        self._force_redetect_every = 120
-        self._ema_alpha = 0.85
-        self._lk_win = (15, 15)
-        self._lk_levels = 3
-        self._lk_err_thresh = 20.0
-        self._reproj_thresh_px = 8.0
+        self.trim_bezel = bool(trim_bezel)
+        self.max_trim_px = int(max_trim_px)
+        self.min_pair_area_ratio = float(min_pair_area_ratio)
+        self.max_pair_area_ratio = float(max_pair_area_ratio)
+        self.max_center_delta_frac = float(max_center_delta_frac)
+        self.search_in_px = int(search_in_px)
+        self.bezel_min_px = int(bezel_min_px)
+        self.bezel_max_px = max(int(bezel_max_px), self.max_trim_px)
+        _ = kwargs
 
     # ---------- PUBLIC ----------
     def detect(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        self._frame_i += 1
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        tracked_ok = False
-        if self.last_quad is not None and self._prev_gray is not None and self._prev_pts is not None:
-            # never let a tracking error bubble up
-            try:
-                tracked_ok = self._track(gray)
-            except Exception:
-                tracked_ok = False
-
-        if (self.last_quad is None) or (not tracked_ok) or (self._frame_i % self._force_redetect_every == 0):
-            quad = self._detect_monitor(frame)
-            if quad is not None:
-                # enforce uniform inner border for consistency
-                quad = _snap_to_uniform_border(gray, quad, search_px=60, pick_inner=self._prefer_inner_border)
-                self._set_tracking_seed(gray, quad)
-
-        quad_out = None if self.last_quad is None else self.last_quad.copy()
-        if quad_out is not None and self.trim_bezel and self.max_trim_px > 0:
-            quad_out = _snap_to_uniform_border(
-                gray, quad_out, search_px=min(20, self.max_trim_px), pick_inner=True
-            )
-        return quad_out
+        pair = self._detect_inner_outer(frame)
+        return None if pair is None else pair[1]
 
     def rectify(self, frame: np.ndarray, quad: np.ndarray) -> np.ndarray:
         src = _order_quad(quad.astype(np.float32))
@@ -205,219 +237,147 @@ class ScreenRectifier:
                         [self.target_w - 1, 0],
                         [self.target_w - 1, self.target_h - 1],
                         [0, self.target_h - 1]], dtype=np.float32)
-        H_now = cv2.getPerspectiveTransform(src, dst)
-        if self._H_ema is None:
-            self._H_ema = H_now
-        else:
-            a = self._ema_alpha
-            self._H_ema = (a * self._H_ema + (1 - a) * H_now).astype(np.float32)
-        return cv2.warpPerspective(frame, self._H_ema, (self.target_w, self.target_h))
+        H = cv2.getPerspectiveTransform(src, dst)
+        return cv2.warpPerspective(frame, H, (self.target_w, self.target_h))
 
     def annotate(self, frame: np.ndarray, quad: np.ndarray) -> np.ndarray:
         out = frame.copy()
-        cv2.polylines(out, [quad.astype(int)], True, (0, 0, 255), 3, cv2.LINE_AA)
+        cv2.polylines(out, [quad.astype(int)], True, (0, 255, 0), 3, cv2.LINE_AA)  # inner in green
         return out
 
     def warp_to_size(self, frame: np.ndarray, quad: np.ndarray) -> np.ndarray:
         return _warp_to_size(frame, quad, self.target_w, self.target_h)
 
-    # ---------- internal ----------
-    def _set_tracking_seed(self, gray: np.ndarray, quad: np.ndarray):
-        self.last_quad = _order_quad(quad.astype(np.float32))
-        self._prev_pts = self.last_quad.reshape(4, 1, 2).astype(np.float32)
-        self._prev_gray = gray
-        self._H_ema = None
+    # ---------- internal: return (outer_quad, inner_quad) ----------
+    def _detect_inner_outer(self, frame_bgr: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        outer = self._detect_largest_quad(frame_bgr)
+        if outer is None:
+            return None
 
-    def _track(self, gray: np.ndarray) -> bool:
-        # If we don't have a valid seed, ask caller to re-detect
-        if self._prev_gray is None or self._prev_pts is None or self.last_quad is None:
-            return False
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        try:
-            p1, st, err = cv2.calcOpticalFlowPyrLK(
-                self._prev_gray, gray, self._prev_pts, None,
-                winSize=self._lk_win, maxLevel=self._lk_levels,
-                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-            )
-        except cv2.error:
-            # optical flow failed — refresh seed on next loop
-            self._prev_gray = gray
-            return False
+        inner = _refine_to_inner(
+            gray, outer,
+            search_in_px=max(self.search_in_px, self.max_trim_px),
+            bezel_min_px=self.bezel_min_px,
+            bezel_max_px=self.bezel_max_px,
+            delta=6,
+            strip=3,
+        )
 
-        # Guard all Nones
-        if p1 is None or st is None or err is None:
-            self._prev_gray = gray
-            return False
+        # sanity checks
+        if not all(_point_in_quad(inner[k], outer) for k in range(4)):
+            # pull inner slightly toward centroid to ensure containment
+            cx, cy = _quad_center(outer)
+            v = inner - np.array([[cx,cy]], dtype=np.float32)
+            inner = inner - 0.03 * v  # 3% toward center
+            inner = _order_quad(inner.astype(np.float32))
 
-        st = st.reshape(-1)
-        err = err.reshape(-1)
-        ok = (st == 1) & (err < self._lk_err_thresh)
+        if _quad_area(inner) < 0.60 * _quad_area(outer):
+            # if too small due to glare/over-shift, ease back outward a bit
+            inner = _order_quad(0.15*outer + 0.85*inner)
 
-        # Need at least 4 correspondences for a homography
-        if int(ok.sum()) < 4:
-            # Keep last_quad but force a re-detect in caller
-            self._prev_pts = self.last_quad.reshape(4, 1, 2).astype(np.float32)
-            self._prev_gray = gray
-            return False
+        return outer, inner
 
-        p0_ok = self._prev_pts.reshape(-1, 2)[ok]
-        p1_ok = p1.reshape(-1, 2)[ok]
-
-        try:
-            H, _ = cv2.findHomography(p0_ok, p1_ok, cv2.RANSAC, 3.0)
-        except cv2.error:
-            self._prev_gray = gray
-            return False
-
-        if H is None:
-            self._prev_gray = gray
-            return False
-
-        # Update quad via homography
-        q_old = self.last_quad.reshape(-1, 1, 2)
-        q_new = cv2.perspectiveTransform(q_old, H).reshape(4, 2)
-
-        # Reprojection sanity check
-        reproj = float(np.mean(np.linalg.norm(q_new - self.last_quad, axis=1)))
-
-        self.last_quad = _order_quad(q_new.astype(np.float32))
-        self._prev_pts = self.last_quad.reshape(4, 1, 2).astype(np.float32)
-        self._prev_gray = gray
-
-        return reproj <= self._reproj_thresh_px
-
-    # ---- detection: contours first, then line-based fallback ----
-    def _detect_monitor(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
-        quad = self._detect_by_contours(frame_bgr)
-        if quad is not None:
-            return quad
-        return self._detect_by_lines(frame_bgr)
-
-    def _detect_by_contours(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+    # Largest acceptable big quad (seed)
+    def _detect_largest_quad(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
         H, W = frame_bgr.shape[:2]
-        scale = 960.0 / max(H, W)
-        small = cv2.resize(frame_bgr, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA) if scale < 1 else frame_bgr.copy()
+        max_side = max(W, H)
+        scale = 1280.0 / max_side if max_side > 1280 else 1.0
+        small = frame_bgr if scale == 1.0 else cv2.resize(frame_bgr, (int(W*scale), int(H*scale)), cv2.INTER_AREA)
         sh, sw = small.shape[:2]
 
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        sharp = cv2.addWeighted(gray, 1.6, cv2.GaussianBlur(gray, (0, 0), 3), -0.6, 0)
+        edges = cv2.Canny(gray, 50, 150)
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), 1)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), 1)
 
-        edges = cv2.Canny(sharp, 60, 180)
-        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
-
-        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         if not cnts:
             return None
 
-        cx, cy = sw / 2.0, sh / 2.0
-        img_area = sw * sh
-        best, best_score = None, -1e9
-
+        min_area_small = (2.0 / 3.0) * (sw * sh)
+        best = None
+        best_area = -1.0
         for c in cnts:
-            area = cv2.contourArea(c)
-            if area < 0.12 * img_area:  # relaxed
-                continue
             peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True).reshape(-1, 2)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
             if len(approx) != 4:
                 continue
-            if not cv2.isContourConvex(approx.astype(np.int32)):
+            pts = approx.reshape(-1, 2).astype(np.float32)
+            if not cv2.isContourConvex(pts.astype(np.int32)):
                 continue
-
-            pts = approx.astype(np.float32)
-            A = _quad_area(pts)
-            rect_err = _poly_orthogonality_score(pts)
-            M = cv2.moments(pts)
-            if abs(M["m00"]) < 1e-6:
+            area = cv2.contourArea(pts)
+            if area < min_area_small:
                 continue
-            x0, y0 = M["m10"]/M["m00"], M["m01"]/M["m00"]
-            center_penalty = np.hypot(x0 - cx, y0 - cy) / max(sw, sh)
-            bezel_delta = _mean_inside_outside(gray, pts, 8, 8) / 255.0
-
-            score = (
-                2.2 * (A / img_area)
-                - 0.7 * rect_err
-                - 3.0 * center_penalty
-                + 1.2 * bezel_delta
-            )
-            if score > best_score:
-                best_score, best = score, pts
+            if _poly_orthogonality_score(pts) > 12.0:
+                continue
+            if area > best_area:
+                best_area = area
+                best = _order_quad(pts)
 
         if best is None:
             return None
-        if scale < 1:
-            best = best / np.float32(scale)
-        return _order_quad(best)
+        return best / np.float32(scale) if scale != 1.0 else best
 
-    def _detect_by_lines(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
-        H, W = frame_bgr.shape[:2]
-        down = 2
-        h, w = H // down, W // down
-        small = cv2.resize(frame_bgr, (w, h), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        gray = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=7)
+# ----------------- GUI demo (mac-friendly, no prints required) -----------------
 
-        lsd = _make_lsd()
-        segments: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
-        min_len = 0.18 * max(w, h)
+def _draw_two_quads(img: np.ndarray, outer: Optional[np.ndarray], inner: Optional[np.ndarray]) -> np.ndarray:
+    vis = img.copy()
+    if outer is not None:
+        cv2.polylines(vis, [outer.astype(int)], True, (255, 0, 0), 4, cv2.LINE_AA)  # BLUE = outer bezel
+    if inner is not None:
+        cv2.polylines(vis, [inner.astype(int)], True, (0, 255, 0), 4, cv2.LINE_AA)  # GREEN = inner screen
+    # legend
+    cv2.rectangle(vis, (20, 20), (420, 110), (20, 20, 20), -1)
+    cv2.circle(vis, (44, 56), 10, (255, 0, 0), -1); cv2.putText(vis, "Outer (bezel)", (64, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (240,240,240), 2, cv2.LINE_AA)
+    cv2.circle(vis, (44, 96), 10, (0, 255, 0), -1); cv2.putText(vis, "Inner (display)", (64, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (240,240,240), 2, cv2.LINE_AA)
+    return vis
 
-        if lsd is not None:
-            try:
-                lines, _, _, _ = lsd.detect(gray)
-            except Exception:
-                lines = None
-            if lines is not None:
-                for L in lines:
-                    x1, y1, x2, y2 = L[0]
-                    length = float(np.hypot(x2 - x1, y2 - y1))
-                    if length < min_len: continue
-                    angle = (np.degrees(np.arctan2((y2 - y1), (x2 - x1))) + 180.0) % 180.0
-                    segments.append((np.array([x1, y1]), np.array([x2, y2]), length, angle))
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Detect monitor inner/outer borders and visualize (GUI only).")
+    parser.add_argument("--image", default="../../snapshots/display_day.png", help="Path to input image")
+    parser.add_argument("--save", default="", help="Optional path to save visualization (PNG/JPG)")
+    args = parser.parse_args()
 
-        if not segments:
-            edges = cv2.Canny(gray, 60, 180)
-            hp = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100,
-                                 minLineLength=int(min_len), maxLineGap=20)
-            if hp is None:
-                return None
-            for x1, y1, x2, y2 in hp[:, 0, :]:
-                length = float(np.hypot(x2 - x1, y2 - y1))
-                angle = (np.degrees(np.arctan2((y2 - y1), (x2 - x1))) + 180.0) % 180.0
-                segments.append((np.array([x1, y1]), np.array([x2, y2]), length, angle))
+    img = cv2.imread(args.image)
+    if img is None:
+        raise SystemExit(f"[error] Cannot read image: {args.image}")
 
-        def is_vertical(theta):   return abs(theta - 90.0) <= 20.0
-        def is_horizontal(theta): return min(abs(theta - 0.0), abs(theta - 180.0)) <= 20.0
+    rect = ScreenRectifier()
+    pair = rect._detect_inner_outer(img)
+    vis = img.copy()
+    if pair is None:
+        cv2.rectangle(vis, (20, 20), (20 + 540, 20 + 60), (20, 20, 20), -1)
+        cv2.putText(vis, "NO SCREEN DETECTED", (36, 64), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
+    else:
+        outer_q, inner_q = pair
+        vis = _draw_two_quads(vis, outer_q, inner_q)
 
-        vertical = [s for s in segments if is_vertical(s[3])]
-        horiz = [s for s in segments if is_horizontal(s[3])]
-        if len(vertical) < 2 or len(horiz) < 2:
-            return None
+    # Optional save
+    if args.save:
+        _ = cv2.imwrite(args.save, vis)
 
-        def line_and_offset(seg):
-            p1, p2, *_ = seg
-            L = _line_from_segment(p1, p2)
-            cx, cy = w / 2.0, h / 2.0
-            offset = L[0] * cx + L[1] * cy + L[2]
-            return L, offset
+    win_name = "Screen detector (blue=outer, green=inner) — ESC/q to close, s to save"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_EXPANDED)
+    max_w, max_h = 1600, 1000
+    h, w = vis.shape[:2]
+    scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
+    disp = vis if scale >= 0.999 else cv2.resize(vis, (int(w * scale), int(h * scale)), cv2.INTER_AREA)
+    cv2.imshow(win_name, disp)
 
-        v_sorted = sorted([line_and_offset(s) for s in vertical], key=lambda x: x[1])
-        h_sorted = sorted([line_and_offset(s) for s in horiz], key=lambda x: x[1])
+    save_path = args.save
+    while True:
+        key = cv2.waitKey(16) & 0xFF
+        if key in (27, ord('q')):  # ESC or 'q'
+            break
+        if key == ord('s'):
+            if not save_path:
+                base, ext = os.path.splitext(os.path.basename(args.image))
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                save_path = os.path.join(os.path.dirname(args.image), f"{base}_vis_{stamp}.png")
+            _ = cv2.imwrite(save_path, vis)
 
-        L_left, L_right = v_sorted[0][0], v_sorted[-1][0]
-        L_top, L_bottom = h_sorted[0][0], h_sorted[-1][0]
-
-        p_tl = _intersect_lines(L_left, L_top)
-        p_tr = _intersect_lines(L_right, L_top)
-        p_br = _intersect_lines(L_right, L_bottom)
-        p_bl = _intersect_lines(L_left, L_bottom)
-        if any(p is None for p in (p_tl, p_tr, p_br, p_bl)):
-            return None
-
-        quad_small = np.vstack([p_tl, p_tr, p_br, p_bl]).astype(np.float32)
-        area = cv2.contourArea(quad_small.reshape(-1, 1, 2))
-        if area < 0.20 * w * h:
-            return None
-
-        return quad_small * np.array([down, down], dtype=np.float32)
+    cv2.destroyAllWindows()

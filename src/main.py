@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import sys, signal
 from PyQt5 import QtCore, QtWidgets
-from src.common.logging_config import setup_logging
-from src.gui.main_window import MainWindow
+from src.backup.common.logging_config import setup_logging
+from src.backup.gui.main_window import MainWindow
 
 def main():
     setup_logging()

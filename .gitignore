@@ -12,6 +12,8 @@ src/script/monstor_image
 src/script/other_image/
 src/script/out/
 src/script/runs/
+src/script/raw_images/
+src/script/yolo_input/
 
 # mac file
 .DS_Store

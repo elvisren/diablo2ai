@@ -36,7 +36,7 @@ def read_classes(dataset_dir: pathlib.Path) -> List[str]:
             return names
 
     # 2) dataset.yaml (YOLO-style)
-    data_yaml = dataset_dir / "dataset.yaml"
+    data_yaml = dataset_dir / "data.yaml"
     if data_yaml.exists():
         try:
             with data_yaml.open("r", encoding="utf-8") as f:
@@ -320,7 +320,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if w:
                 w.deleteLater()
         if not self.class_names:
-            lab = QtWidgets.QLabel("No class names found (classes.txt or dataset.yaml). Showing numeric ids.")
+            lab = QtWidgets.QLabel("No class names found (classes.txt or data.yaml). Showing numeric ids.")
             self.legend_layout.addWidget(lab)
             return
         title = QtWidgets.QLabel("Classes:")
